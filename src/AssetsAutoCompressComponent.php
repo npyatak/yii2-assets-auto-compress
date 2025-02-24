@@ -8,6 +8,7 @@
 
 namespace skeeks\yii2\assetsAuto;
 
+use MatthiasMullie\Minify;
 use yii\base\BootstrapInterface;
 use yii\base\Component;
 use yii\base\Event;
@@ -243,7 +244,7 @@ class AssetsAutoCompressComponent extends Component implements BootstrapInterfac
                 $response = $event->sender;
 
                 if ($this->enabled && ($this->htmlFormatter instanceof IFormatter) && $response->format == \yii\web\Response::FORMAT_HTML && !$app->request->isAjax && !$app->request->isPjax) {
-                    if (!empty($response->data) && is_string($response->data)) {
+                    if (!empty($response->data)) {
                         $response->data = $this->_processingHtml($response->data);
                     }
                 }
@@ -259,9 +260,6 @@ class AssetsAutoCompressComponent extends Component implements BootstrapInterfac
         //echo "<pre><code>" . print_r($view->jsFiles, true);die;
         if ($view->jsFiles && $this->jsFileCompile) {
             \Yii::beginProfile('Compress js files');
-            /*if (YII_ENV_DEV) {
-                echo "<pre><code>" . print_r($view->jsFiles, true);
-            }*/
             foreach ($view->jsFiles as $pos => $files) {
                 if ($files) {
                     if ($this->jsFileCompileByGroups) {
@@ -273,10 +271,7 @@ class AssetsAutoCompressComponent extends Component implements BootstrapInterfac
             }
             \Yii::endProfile('Compress js files');
         }
-        /*if (YII_ENV_DEV) {
-            echo "<pre><code>" . print_r($view->jsFiles, true);die;
-        }*/
-        
+        //echo "<pre><code>" . print_r($view->jsFiles, true);die;
 
         //Compiling js code that is found in the html code of the page.
         if ($view->js && $this->jsCompress) {
@@ -360,15 +355,14 @@ JS
 
         $result = [];
         $groupedFiles = $this->_getGroupedFiles($files);
-        /*print_r($groupedFiles);die;*/
         foreach ($groupedFiles as $files) {
             $resultGroup = $this->_processingJsFiles($files);
             $result = ArrayHelper::merge($result, $resultGroup);
         }
 
         return $result;
-        /*echo "<pre><code>".print_r($result, true);
-        die;*/
+        echo "<pre><code>".print_r($result, true);
+        die;
 
     }
 
@@ -418,6 +412,7 @@ JS
             if (!$this->jsFileRemouteCompile) {
                 foreach ($files as $fileCode => $fileTag) {
                     if (!Url::isRelative($fileCode)) {
+                        $fileCode = $this->getFileCode($fileCode);
                         $resultFiles[$fileCode] = $fileTag;
                     }
                 }
@@ -436,6 +431,7 @@ JS
             foreach ($files as $fileCode => $fileTag) {
                 if (Url::isRelative($fileCode)) {
                     if ($pos = strpos($fileCode, "?")) {
+                        $fileCode = $this->getFileCode($fileCode);
                         $fileCode = substr($fileCode, 0, $pos);
                     }
 
@@ -607,6 +603,7 @@ JS
             if (!$this->cssFileRemouteCompile) {
                 foreach ($files as $fileCode => $fileTag) {
                     if (!Url::isRelative($fileCode)) {
+                        $fileCode = $this->getFileCode($fileCode);
                         $resultFiles[$fileCode] = $fileTag;
                     }
                 }
@@ -623,6 +620,7 @@ JS
             $resultFiles = [];
             foreach ($files as $fileCode => $fileTag) {
                 if (Url::isRelative($fileCode)) {
+                    $fileCode = $this->getFileCode($fileCode);
                     $fileCodeLocal = $fileCode;
                     if ($pos = strpos($fileCode, "?")) {
                         $fileCodeLocal = substr($fileCodeLocal, 0, $pos);
@@ -637,10 +635,9 @@ JS
                     unset($fileCodeTmp[count($fileCodeTmp) - 1]);
                     $prependRelativePath = implode("/", $fileCodeTmp)."/";
 
-                    //print_r($prependRelativePath);die;
-                    $contentTmp = \Minify_CSS::minify($contentTmp, [
-                        "prependRelativePath" => $prependRelativePath,
+                    $contentTmp = $this->fixRelativeInCSS($contentTmp, $this->webroot . $prependRelativePath, $rootDir);
 
+                    $contentTmp = \Minify_CSS::minify($contentTmp, [
                         'compress'         => true,
                         'removeCharsets'   => true,
                         'preserveComments' => true,
@@ -672,7 +669,8 @@ JS
             }
 
             if ($this->cssFileCompress) {
-                $content = \CssMin::minify($content, [], ["Variables" => false]);
+                $content = (new Minify\CSS($content))->minify();
+                //$content = \CssMin::minify($content);
             }
 
             $page = \Yii::$app->request->absoluteUrl;
@@ -711,7 +709,7 @@ JS
         }
 
         $css = implode("\n", $newCss);
-        $css = \CssMin::minify($css, [], ["Variables" => false]);
+        $css = \CssMin::minify($css);
         return [md5($css) => "<style>".$css."</style>"];
     }
 
@@ -734,6 +732,137 @@ JS
         return $html;
     }
 
+    /**
+     * Fix for Yii version 2.0.39 and higher if the project has a non-empty baseUrl
+     *
+     * @param  string $fileCode Path to file
+     *
+     * @return string
+     * @link   https://github.com/yiisoft/yii2/issues/18414
+     */
+    protected function getFileCode($fileCode)
+    {
+        return !empty(\Yii::$app->request->getBaseUrl()) ? str_replace(\Yii::$app->request->getBaseUrl(), '', $fileCode) : $fileCode;
+    }
+
+    /**
+     * CSS fix where relative path starts with dots
+     *
+     * @param  string $code     CSS code
+     * @param  string $old_path Full path to the source file
+     * @param  string $new_path Full path to the final file
+     *
+     * @return string CSS with corrected paths
+     */
+    protected function fixRelativeInCSS($code, $old_path, $new_path)
+    {
+        $list = [];
+
+        // Find patterns
+        $pattern = '/@import\\s+([^)]*)/Us';
+        preg_match_all($pattern, $code, $list1);
+        if (isset($list1[1]) && !empty($list1[1])) foreach ($list1[1] as $item) { $list[] = trim($item, '\'" '); }
+
+        $pattern = '/url\\(([^)]*)\\)/Us';
+        preg_match_all($pattern, $code, $list2);
+        if (isset($list2[1]) && !empty($list2[1])) foreach ($list2[1] as $item) { $list[] = trim($item, '\'" '); }
+
+        // We leave only paths with points
+        foreach ($list as $key => $value) { if (!preg_match('/^[\.]*\//', $value)) unset($list[$key]); }
+
+        // Determining where paths start to differ
+        $old_path = explode('/', rtrim(str_replace('\\', '/', $old_path), '/'));
+        $new_path = explode('/', rtrim(str_replace('\\', '/', $new_path), '/'));
+
+        $f = count($old_path) > count($new_path) ? $old_path : $new_path;
+        $eq = 0;
+
+        /**
+         * Example:
+         * $new_path = /var/www/site/web/assets/css-compress
+         * $old_path = /var/www/site/web/css
+         *
+         * $eq = 4
+         */
+        foreach ($f as $key => $value) { if (isset($new_path[$key]) && isset($old_path[$key]) && $new_path[$key] === $old_path[$key]) $eq = $key; }
+
+        // Correcting relative paths for the new location
+        foreach ($list as $item)
+        {
+            $e = explode('/', $item);
+            $pos = count($old_path) - 1;
+
+            /**
+             * Example 1:
+             * $item = ../images/image1.png
+             *
+             * 1 iteration: $pos = 5 or 'css'
+             * 2 iteration: $pos = 4 or 'web'
+             *
+             * Example 2:
+             * $item = ../../images/image1.png
+             *
+             * 1 iteration: $pos = 5 or 'css'
+             * 2 iteration: $pos = 4 or 'web'
+             * 3 iteration: $pos = 3 or 'site'
+             *
+             * Example 3:
+             * $item = images/image1.png
+             *
+             * $pos = 5 or 'css'
+             */
+            foreach ($e as $key => $i)
+            {
+                if ($i === '..')
+                {
+                    $pos--;
+                    unset($e[$key]);
+                }
+            }
+
+            $n = count($new_path) - 1;
+
+            if ($pos <= $eq)
+            {
+                /**
+                 * Example 1:
+                 * for /var/www/site/web/css url = ../images/image1.png
+                 *
+                 * $n = 7 - 1 - 4 = 2
+                 *
+                 * then for /var/www/site/web/assets/css-compress $new_item = ../../images/image1.png
+                 *
+                 * Example 2:
+                 * for /var/www/site/web/css url = ../../images/image1.png
+                 *
+                 * $n = 7 - 1 - 3 = 3
+                 *
+                 * then for /var/www/site/web/assets/css-compress $new_item = ../../../images/image1.png
+                 */
+                $n -= $pos;
+                $prefix = str_repeat('../', $n);
+            }
+            else
+            {
+                /**
+                 * Example:
+                 * for /var/www/site/web/css url = images/image1.png
+                 *
+                 * $n = 7 - 1 - 4 = 2
+                 *
+                 * then for /var/www/site/web/assets/css-compress $new_item = ../../css/images/image1.png
+                 */
+                $n -= $eq;
+                $prefix = str_repeat('../', $n) . end($old_path);
+            }
+
+            $new_item = $prefix . implode('/', $e);
+
+            $code = str_replace($item, $new_item, $code);
+        }
+
+        return $code;
+    }
 
     /**
      * @param $value
